@@ -1,0 +1,170 @@
+# Entra group-to-Enterprise-Application app-role assignment.
+# Queue only through Azure DevOps Runs API; repository is the private GitHub repo.
+trigger: none
+pr: none
+
+parameters:
+  - name: AppId
+    type: string
+    default: ''
+  - name: AppObjectId
+    type: string
+    default: ''
+  - name: AppDisplayName
+    type: string
+    default: ''
+  - name: TenantId
+    type: string
+    default: ''
+  - name: GroupName
+    type: string
+    default: ''
+  - name: GroupObjectId
+    type: string
+    default: ''
+  - name: RoleName
+    type: string
+    default: ''
+  - name: RequesterEmail
+    type: string
+    default: ''
+  - name: RITMNumber
+    type: string
+    default: ''
+
+resources:
+  repositories:
+    - repository: githubRepo
+      type: github
+      name: YOUR_GITHUB_OWNER/DevOps-Monitoring
+      endpoint: GitHub-Service-Connection
+      ref: refs/heads/main
+
+# Replace this with your existing self-hosted Windows pool.
+pool:
+  name: $(WindowsAgentPool)
+
+variables:
+  # This variable group must be linked to Key Vault in Azure DevOps Library.
+  - group: VG-Entra-Automation-KeyVault
+  - name: WindowsAgentPool
+    value: YOUR_SELF_HOSTED_WINDOWS_POOL
+
+steps:
+  - checkout: githubRepo
+    path: DevOps-Monitoring
+    clean: true
+    persistCredentials: false
+
+  # Execute the script. Request values and secrets are passed via environment
+  # variables, not command-line arguments. Capture the script exit code without
+  # failing this step so the optional ServiceNow update can still run.
+  - task: PowerShell@2
+    name: RunAssignment
+    displayName: Validate and assign Entra group
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $ErrorActionPreference = 'Stop'
+        $scriptPath = Join-Path '$(Pipeline.Workspace)' 'DevOps-Monitoring/entra-group-automation/Add-EntraGroupToApp.ps1'
+        $code = 4
+
+        try {
+          if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+            throw "PowerShell script not found: $scriptPath"
+          }
+
+          $argsForScript = @{
+            AppId                       = $env:INPUT_APP_ID
+            AppObjectId                 = $env:INPUT_APP_OBJECT_ID
+            ServicePrincipalObjectId     = $env:INPUT_SP_OBJECT_ID
+            TenantId                    = $env:INPUT_TENANT_ID
+            AppDisplayName              = $env:INPUT_APP_DISPLAY_NAME
+            GroupName                   = $env:INPUT_GROUP_NAME
+            GroupObjectId               = $env:INPUT_GROUP_OBJECT_ID
+            RoleName                    = $env:INPUT_ROLE_NAME
+            RequesterEmail              = $env:INPUT_REQUESTER_EMAIL
+            RITMNumber                  = $env:INPUT_RITM_NUMBER
+          }
+
+          & $scriptPath @argsForScript
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { $code = 4 }
+        }
+        catch {
+          Write-Host "##vso[task.logissue type=error]$($_.Exception.Message)"
+          $code = 4
+        }
+
+        Write-Host "Assignment script exit code: $code"
+        Write-Host "##vso[task.setvariable variable=AssignmentExitCode]$code"
+        Write-Host "##vso[task.setvariable variable=AssignmentExitCode;isOutput=true]$code"
+        exit 0
+    env:
+      INPUT_APP_ID: ${{ parameters.AppId }}
+      INPUT_APP_OBJECT_ID: ${{ parameters.AppObjectId }}
+      INPUT_SP_OBJECT_ID: ${{ parameters.ServicePrincipalObjectId }}
+      INPUT_TENANT_ID: ${{ parameters.TenantId }}
+      INPUT_APP_DISPLAY_NAME: ${{ parameters.AppDisplayName }}
+      INPUT_GROUP_NAME: ${{ parameters.GroupName }}
+      INPUT_GROUP_OBJECT_ID: ${{ parameters.GroupObjectId }}
+      INPUT_ROLE_NAME: ${{ parameters.RoleName }}
+      INPUT_REQUESTER_EMAIL: ${{ parameters.RequesterEmail }}
+      INPUT_RITM_NUMBER: ${{ parameters.RITMNumber }}
+
+      # Secret values are supplied by the authorized Key Vault-backed variable group.
+      ENTRA_TENANT_ID: $(ENTRA-TENANT-ID)
+      ENTRA_CLIENT_ID: $(ENTRA-CLIENT-ID)
+      ENTRA_CLIENT_SECRET: $(ENTRA-CLIENT-SECRET)
+
+      # Optional Graph email sender. Set MAIL-ENABLED to true to enable.
+      MAIL_ENABLED: $(MAIL-ENABLED)
+      MAIL_SENDER_USER_ID: $(MAIL-SENDER-USER-ID)
+      MAIL_SENDER_TENANT_ID: $(MAIL-SENDER-TENANT-ID)
+      MAIL_SENDER_CLIENT_ID: $(MAIL-SENDER-CLIENT-ID)
+      MAIL_SENDER_CLIENT_SECRET: $(MAIL-SENDER-CLIENT-SECRET)
+
+      # Script owns the optional ServiceNow update to avoid duplicate work-note updates.
+      SNOW_ENABLED: $(SNOW-ENABLED)
+      SNOW_INSTANCE_URL: $(SNOW-INSTANCE-URL)
+      SNOW_USERNAME: $(SNOW-USERNAME)
+      SNOW_PASSWORD: $(SNOW-PASSWORD)
+      SNOW_RITM_TABLE: $(SNOW-RITM-TABLE)
+      SNOW_STATE: $(SNOW-STATE)
+
+  # Always run classification after the assignment wrapper. Exit 2 is a warning
+  # (SucceededWithIssues); codes 1, 3 and 4 fail the pipeline.
+  - task: PowerShell@2
+    displayName: Set final pipeline result
+    condition: always()
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $raw = '$(AssignmentExitCode)'
+        $code = 4
+        if ($raw -match '^\d+$') { $code = [int]$raw }
+
+        switch ($code) {
+          0 {
+            Write-Host 'Assignment created successfully.'
+            Write-Host '##vso[task.complete result=Succeeded;]Assignment created.'
+          }
+          2 {
+            Write-Warning 'Group already assigned with the selected role.'
+            Write-Host '##vso[task.complete result=SucceededWithIssues;]Already assigned.'
+          }
+          1 {
+            Write-Host '##vso[task.complete result=Failed;]Group not found or invalid.'
+            exit 1
+          }
+          3 {
+            Write-Host '##vso[task.complete result=Failed;]Application or role missing/invalid.'
+            exit 1
+          }
+          default {
+            Write-Host '##vso[task.complete result=Failed;]Unexpected failure.'
+            exit 1
+          }
+        }
